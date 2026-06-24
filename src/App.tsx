@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { MediaItem, Settings } from './types'
+import type { MediaItem, Settings, UpdateInfo } from './types'
 import {
   DEFAULT_SETTINGS,
   getTransitionLossSec,
@@ -25,16 +25,16 @@ function buildPhotoHint(
   photoCount: number,
   photoDurationSec: number,
   videoSeconds: number,
-  transitionLoss: number,
+  crossfadeLoss: number,
 ): string | null {
   if (photoCount === 0) return null
 
   const photoMin = Math.round((photoCount * photoDurationSec) / 60)
   const targetMin = 10
   const targetSec = targetMin * 60
-  const availableForPhotos = targetSec - videoSeconds + transitionLoss
+  const availableForPhotos = targetSec - videoSeconds + crossfadeLoss
   const suggestedSec = Math.max(1, Math.round((availableForPhotos / photoCount) * 2) / 2)
-  const suggestedTotal = photoCount * suggestedSec + videoSeconds - transitionLoss
+  const suggestedTotal = photoCount * suggestedSec + videoSeconds - crossfadeLoss
   const suggestedMin = Math.max(1, Math.round(suggestedTotal / 60))
 
   if (Math.abs(suggestedSec - photoDurationSec) < 0.5) return null
@@ -51,32 +51,12 @@ function shuffleArray<T>(arr: T[]): T[] {
   return next
 }
 
-function OptionRow({
-  label,
-  hint,
-  children,
-}: {
-  label: string
-  hint: string
-  children: React.ReactNode
-}) {
-  return (
-    <div className="option-row">
-      <div className="option-label">
-        <span>{label}</span>
-        <span className="option-hint">{hint}</span>
-      </div>
-      <div className="option-control">{children}</div>
-    </div>
-  )
-}
-
 export default function App() {
   const [items, setItems] = useState<MediaItem[]>([])
   const [musicPath, setMusicPath] = useState<string | null>(null)
   const [musicName, setMusicName] = useState<string | null>(null)
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS)
-  const [optionsOpen, setOptionsOpen] = useState(false)
+  const [showMoreOptions, setShowMoreOptions] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [exporting, setExporting] = useState(false)
@@ -84,14 +64,15 @@ export default function App() {
   const [exportError, setExportError] = useState<string | null>(null)
   const [arranging, setArranging] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
-  const [updateMessage, setUpdateMessage] = useState<string | null>(null)
+  const [updateStatus, setUpdateStatus] = useState<UpdateInfo | null>(null)
+  const [checkingUpdates, setCheckingUpdates] = useState(false)
 
   useEffect(() => {
-    const { settings: saved, musicPath: savedMusic } = loadPersistedState()
-    setSettings(saved)
-    if (savedMusic) {
-      setMusicPath(savedMusic)
-      setMusicName(savedMusic.split(/[/\\]/).pop() ?? savedMusic)
+    const persisted = loadPersistedState()
+    setSettings(persisted.settings)
+    if (persisted.musicPath) {
+      setMusicPath(persisted.musicPath)
+      setMusicName(persisted.musicPath.split(/[/\\]/).pop() ?? persisted.musicPath)
     }
   }, [])
 
@@ -100,18 +81,12 @@ export default function App() {
   }, [settings, musicPath])
 
   useEffect(() => {
-    const unsub = window.electronAPI.onExportProgress((p) => setExportProgress(p))
-    return unsub
-  }, [])
-
-  useEffect(() => {
-    const unsub = window.electronAPI.onUpdateStatus((info) => {
-      if (info.status === 'checking') setUpdateMessage('Checking for updates…')
-      else if (info.status === 'available') setUpdateMessage(`Update ${info.version} available`)
-      else if (info.status === 'downloaded') setUpdateMessage(`Update ${info.version} ready — restart to install`)
-      else setUpdateMessage(null)
-    })
-    return unsub
+    const unsubProgress = window.electronAPI.onExportProgress((p) => setExportProgress(p))
+    const unsubUpdates = window.electronAPI.onUpdateStatus((info) => setUpdateStatus(info))
+    return () => {
+      unsubProgress()
+      unsubUpdates()
+    }
   }, [])
 
   useEffect(() => {
@@ -120,9 +95,9 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast])
 
-  const updateSettings = useCallback((patch: Partial<Settings>) => {
-    setSettings((s) => ({ ...s, ...patch }))
-  }, [])
+  const updateSetting = <K extends keyof Settings>(key: K, value: Settings[K]) => {
+    setSettings((s) => ({ ...s, [key]: value }))
+  }
 
   const addItems = useCallback(
     async (paths: string[]) => {
@@ -184,7 +159,10 @@ export default function App() {
     if (items.length === 0) return
     setArranging(true)
     try {
-      const result = await window.electronAPI.autoArrange(items)
+      const result = await window.electronAPI.autoArrange(items, {
+        smartVisualDedup: settings.smartVisualDedup,
+        dedupMode: settings.dedupMode,
+      })
       setItems(result.items)
       setToast(result.message)
     } finally {
@@ -193,11 +171,17 @@ export default function App() {
   }
 
   const handleCheckUpdates = async () => {
-    const result = await window.electronAPI.checkForUpdates()
-    if (result.status === 'not-available' && result.message) {
-      setToast(result.message)
-    } else if (result.status === 'error' && result.message) {
-      setToast(result.message)
+    setCheckingUpdates(true)
+    try {
+      const info = await window.electronAPI.checkForUpdates()
+      setUpdateStatus(info)
+      if (info.status === 'not-available') {
+        setToast(info.message ?? 'You are running the latest version.')
+      } else if (info.status === 'error') {
+        setToast(info.message ?? 'Update check failed')
+      }
+    } finally {
+      setCheckingUpdates(false)
     }
   }
 
@@ -223,7 +207,7 @@ export default function App() {
     }
   }
 
-  const transitionLoss = useMemo(
+  const crossfadeLoss = useMemo(
     () => getTransitionLossSec(settings.transitionStyle, items.length),
     [settings.transitionStyle, items.length],
   )
@@ -237,22 +221,22 @@ export default function App() {
       return sum + clipDuration(item, settings)
     }, 0)
     return {
-      estimatedDuration: Math.max(0, clipSum - transitionLoss),
+      estimatedDuration: Math.max(0, clipSum - crossfadeLoss),
       photoCount: photos,
       videoSeconds: videoSec,
     }
-  }, [items, settings, transitionLoss])
+  }, [items, settings, crossfadeLoss])
 
   const photoHint = useMemo(
-    () => buildPhotoHint(photoCount, settings.photoDurationSec, videoSeconds, transitionLoss),
-    [photoCount, settings.photoDurationSec, videoSeconds, transitionLoss],
+    () => buildPhotoHint(photoCount, settings.photoDurationSec, videoSeconds, crossfadeLoss),
+    [photoCount, settings.photoDurationSec, videoSeconds, crossfadeLoss],
   )
 
   const transitionLabel =
     settings.transitionStyle === 'hard-cut'
       ? 'hard cuts'
       : settings.transitionStyle === 'fade-black'
-        ? 'fade-to-black'
+        ? 'fade-through-black'
         : 'crossfades'
 
   return (
@@ -262,7 +246,6 @@ export default function App() {
       <header className="header">
         <h1>MannyCanDoIt</h1>
         <p className="tagline">Turn your photos &amp; videos into a slideshow with music</p>
-        {updateMessage && <p className="update-banner">{updateMessage}</p>}
       </header>
 
       <section
@@ -294,7 +277,6 @@ export default function App() {
               className="btn btn-secondary"
               onClick={handleShuffle}
               disabled={items.length < 2}
-              title="Randomly reorder the timeline"
             >
               Shuffle
             </button>
@@ -371,7 +353,7 @@ export default function App() {
                 {photoCount > 0 && `${photoCount} photos × ${settings.photoDurationSec}s`}
                 {photoCount > 0 && items.some((i) => i.type === 'video') && ' + '}
                 {items.some((i) => i.type === 'video') && 'videos'}
-                {items.length > 1 && transitionLoss > 0 && ` (−${transitionLoss}s ${transitionLabel})`}
+                {items.length > 1 && crossfadeLoss > 0 && ` (−${crossfadeLoss}s ${transitionLabel})`}
               </span>
             )}
           </div>
@@ -383,7 +365,7 @@ export default function App() {
               max={15}
               step={0.5}
               value={settings.photoDurationSec}
-              onChange={(e) => updateSettings({ photoDurationSec: Number(e.target.value) })}
+              onChange={(e) => updateSetting('photoDurationSec', Number(e.target.value))}
             />
           </label>
           {photoHint && <p className="hint photo-hint">{photoHint}</p>}
@@ -400,176 +382,193 @@ export default function App() {
               max={60}
               step={1}
               value={settings.videoMaxLengthSec}
-              onChange={(e) => updateSettings({ videoMaxLengthSec: Number(e.target.value) })}
+              onChange={(e) => updateSetting('videoMaxLengthSec', Number(e.target.value))}
             />
           </label>
           <p className="hint subtle">Slide video max to 0 for full-length clips. Music follows the video.</p>
         </div>
       </section>
 
-      <section className="options-section">
+      <section className="more-options-section">
         <button
           type="button"
-          className="options-toggle"
-          onClick={() => setOptionsOpen((o) => !o)}
-          aria-expanded={optionsOpen}
+          className="more-options-toggle"
+          onClick={() => setShowMoreOptions((v) => !v)}
+          aria-expanded={showMoreOptions}
         >
-          <span>{optionsOpen ? '▾' : '▸'} More options</span>
-          <span className="options-toggle-hint">Optional — defaults work great</span>
+          <span>More options</span>
+          <span className="chevron">{showMoreOptions ? '▾' : '▸'}</span>
         </button>
 
-        {optionsOpen && (
-          <div className="options-panel">
-            <div className="options-group">
-              <h3>Playback &amp; visuals</h3>
-              <OptionRow label="Ken Burns effect" hint="Subtle slow zoom on photos">
-                <label className="toggle">
+        {showMoreOptions && (
+          <div className="more-options-panel">
+            <div className="options-grid">
+              <div className="option-group">
+                <h3>Video look</h3>
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={settings.kenBurns}
-                    onChange={(e) => updateSettings({ kenBurns: e.target.checked })}
+                    onChange={(e) => updateSetting('kenBurns', e.target.checked)}
                   />
-                  <span>{settings.kenBurns ? 'On' : 'Off'}</span>
+                  Ken Burns effect (slow zoom on photos)
                 </label>
-              </OptionRow>
-              <OptionRow label="Transition style" hint="How clips blend together">
-                <select
-                  value={settings.transitionStyle}
-                  onChange={(e) =>
-                    updateSettings({
-                      transitionStyle: e.target.value as Settings['transitionStyle'],
-                    })
-                  }
-                >
-                  <option value="crossfade">Crossfade</option>
-                  <option value="fade-black">Fade to black</option>
-                  <option value="hard-cut">Hard cut</option>
-                </select>
-              </OptionRow>
-              <OptionRow label="Photo fit" hint="Letterbox or crop to fill the frame">
-                <select
-                  value={settings.photoFit}
-                  onChange={(e) =>
-                    updateSettings({ photoFit: e.target.value as Settings['photoFit'] })
-                  }
-                >
-                  <option value="fit">Fit (letterbox)</option>
-                  <option value="fill">Fill (crop)</option>
-                </select>
-              </OptionRow>
-              <OptionRow label="Output resolution" hint="720p exports faster">
-                <select
-                  value={settings.outputResolution}
-                  onChange={(e) =>
-                    updateSettings({
-                      outputResolution: e.target.value as Settings['outputResolution'],
-                    })
-                  }
-                >
-                  <option value="1080p">1080p</option>
-                  <option value="720p">720p (faster)</option>
-                </select>
-              </OptionRow>
-            </div>
+                <label className="field-label">
+                  Transition style
+                  <select
+                    value={settings.transitionStyle}
+                    onChange={(e) =>
+                      updateSetting('transitionStyle', e.target.value as Settings['transitionStyle'])
+                    }
+                  >
+                    <option value="crossfade">Crossfade</option>
+                    <option value="fade-black">Fade through black</option>
+                    <option value="hard-cut">Hard cut</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  Photo fit
+                  <select
+                    value={settings.photoFit}
+                    onChange={(e) => updateSetting('photoFit', e.target.value as Settings['photoFit'])}
+                  >
+                    <option value="fit">Fit (letterbox)</option>
+                    <option value="fill">Fill (crop)</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  Output resolution
+                  <select
+                    value={settings.outputResolution}
+                    onChange={(e) =>
+                      updateSetting('outputResolution', e.target.value as Settings['outputResolution'])
+                    }
+                  >
+                    <option value="1080p">1080p (1920×1080)</option>
+                    <option value="720p">720p (1280×720)</option>
+                  </select>
+                </label>
+              </div>
 
-            <div className="options-group">
-              <h3>Audio</h3>
-              <OptionRow label="Mute original video audio" hint="Music-only slideshow (recommended)">
-                <label className="toggle">
+              <div className="option-group">
+                <h3>Audio</h3>
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={settings.muteVideoAudio}
-                    onChange={(e) => updateSettings({ muteVideoAudio: e.target.checked })}
+                    onChange={(e) => updateSetting('muteVideoAudio', e.target.checked)}
                   />
-                  <span>{settings.muteVideoAudio ? 'Muted' : 'Keep audio'}</span>
+                  Mute original video audio
                 </label>
-              </OptionRow>
-              <OptionRow label="Music volume" hint="Background music loudness">
-                <div className="volume-control">
+                <label className="slider-label compact">
+                  <span>Music volume: {settings.musicVolume}%</span>
                   <input
                     type="range"
                     min={0}
                     max={100}
                     step={5}
                     value={settings.musicVolume}
-                    onChange={(e) => updateSettings({ musicVolume: Number(e.target.value) })}
+                    onChange={(e) => updateSetting('musicVolume', Number(e.target.value))}
                   />
-                  <span>{settings.musicVolume}%</span>
-                </div>
-              </OptionRow>
-              <OptionRow label="Fade music in/out" hint="2-second fade at start and end">
-                <label className="toggle">
+                </label>
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={settings.fadeMusic}
-                    onChange={(e) => updateSettings({ fadeMusic: e.target.checked })}
+                    onChange={(e) => updateSetting('fadeMusic', e.target.checked)}
                   />
-                  <span>{settings.fadeMusic ? 'On' : 'Off'}</span>
+                  Fade music in/out
                 </label>
-              </OptionRow>
-            </div>
+              </div>
 
-            <div className="options-group">
-              <h3>Import &amp; curation</h3>
-              <OptionRow
-                label="Skip screenshots"
-                hint='Skip files named "Screenshot" or very small images'
-              >
-                <label className="toggle">
+              <div className="option-group">
+                <h3>Import &amp; export</h3>
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={settings.skipScreenshots}
-                    onChange={(e) => updateSettings({ skipScreenshots: e.target.checked })}
+                    onChange={(e) => updateSetting('skipScreenshots', e.target.checked)}
                   />
-                  <span>{settings.skipScreenshots ? 'On' : 'Off'}</span>
+                  Skip screenshots on import
                 </label>
-              </OptionRow>
-              <OptionRow label="Remember last settings" hint="Restore options next time you open the app">
-                <label className="toggle">
-                  <input
-                    type="checkbox"
-                    checked={settings.rememberLastSettings}
-                    onChange={(e) => updateSettings({ rememberLastSettings: e.target.checked })}
-                  />
-                  <span>{settings.rememberLastSettings ? 'On' : 'Off'}</span>
-                </label>
-              </OptionRow>
-            </div>
-
-            <div className="options-group">
-              <h3>Export</h3>
-              <OptionRow label="Open folder when done" hint="Show the finished video in File Explorer">
-                <label className="toggle">
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={settings.openFolderWhenDone}
-                    onChange={(e) => updateSettings({ openFolderWhenDone: e.target.checked })}
+                    onChange={(e) => updateSetting('openFolderWhenDone', e.target.checked)}
                   />
-                  <span>{settings.openFolderWhenDone ? 'On' : 'Off'}</span>
+                  Open folder when export finishes
                 </label>
-              </OptionRow>
-              <OptionRow
-                label="Date filename template"
-                hint='Default save name like "slideshow-2026-06-23.mp4"'
-              >
-                <label className="toggle">
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={settings.outputFilenameTemplate}
-                    onChange={(e) => updateSettings({ outputFilenameTemplate: e.target.checked })}
+                    onChange={(e) => updateSetting('outputFilenameTemplate', e.target.checked)}
                   />
-                  <span>{settings.outputFilenameTemplate ? 'On' : 'Off'}</span>
+                  Use dated filename (slideshow-YYYY-MM-DD.mp4)
                 </label>
-              </OptionRow>
-            </div>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={settings.rememberLastSettings}
+                    onChange={(e) => updateSetting('rememberLastSettings', e.target.checked)}
+                  />
+                  Remember my settings
+                </label>
+              </div>
 
-            <div className="options-group">
-              <h3>Updates</h3>
-              <OptionRow label="Check for updates" hint="Download new versions from GitHub">
-                <button type="button" className="btn btn-secondary btn-sm" onClick={handleCheckUpdates}>
-                  Check now
+              <div className="option-group">
+                <h3>Auto-arrange dedup</h3>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={settings.smartVisualDedup}
+                    onChange={(e) => updateSetting('smartVisualDedup', e.target.checked)}
+                  />
+                  Smart visual dedup (opt-in)
+                </label>
+                {settings.smartVisualDedup && (
+                  <label className="field-label">
+                    Dedup mode
+                    <select
+                      value={settings.dedupMode}
+                      onChange={(e) =>
+                        updateSetting('dedupMode', e.target.value as Settings['dedupMode'])
+                      }
+                    >
+                      <option value="burst">Burst only (3s window)</option>
+                      <option value="visual">Visual similarity</option>
+                      <option value="both">Both burst and visual</option>
+                    </select>
+                  </label>
+                )}
+                <p className="hint subtle">
+                  Default is 3-second burst dedup keeping the sharpest photo. Enable smart dedup to
+                  also find visually similar images.
+                </p>
+              </div>
+
+              <div className="option-group">
+                <h3>Updates</h3>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={handleCheckUpdates}
+                  disabled={checkingUpdates}
+                >
+                  {checkingUpdates ? 'Checking…' : 'Check for updates'}
                 </button>
-              </OptionRow>
+                {updateStatus && (
+                  <p className="hint update-status">
+                    {updateStatus.status === 'checking' && 'Checking for updates…'}
+                    {updateStatus.status === 'available' && `Update ${updateStatus.version} available`}
+                    {updateStatus.status === 'downloaded' &&
+                      `Update ${updateStatus.version} ready — restart to install`}
+                    {updateStatus.status === 'not-available' && 'You are on the latest version'}
+                    {updateStatus.status === 'error' && (updateStatus.message ?? 'Update check failed')}
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         )}

@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process'
 import sharp from 'sharp'
 import exifr from 'exifr'
 import ffmpegPath from 'ffmpeg-static'
-import type { ExportOptions, ExportProgress, MediaItem, Settings, TransitionStyle, UpdateInfo } from '../src/types'
+import type { DedupOptions, ExportOptions, ExportProgress, MediaItem, Settings, TransitionStyle, UpdateInfo } from '../src/types'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -18,6 +18,8 @@ const VIDEO_EXTS = new Set(['.mp4', '.mov', '.m4v'])
 const CROSSFADE_SEC = 1
 const FPS = 30
 const MIN_SCREENSHOT_DIM = 200
+const BURST_MS = 3000
+const VISUAL_HASH_THRESHOLD = 10
 
 let mainWindow: BrowserWindow | null = null
 let manualUpdateCheck = false
@@ -152,6 +154,168 @@ async function computeSharpnessScore(filePath: string): Promise<number> {
   } catch {
     return 0
   }
+}
+
+async function computeDHash(filePath: string): Promise<bigint> {
+  const { data, info } = await sharp(filePath)
+    .rotate()
+    .resize(9, 8, { fit: 'fill' })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+
+  const width = info.width ?? 9
+  const height = info.height ?? 8
+  let hash = 0n
+  let bit = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const left = data[y * width + x]
+      const right = data[y * width + x + 1]
+      if (left > right) hash |= 1n << BigInt(bit)
+      bit++
+    }
+  }
+  return hash
+}
+
+function hammingDistance(a: bigint, b: bigint): number {
+  let xor = a ^ b
+  let count = 0
+  while (xor > 0n) {
+    count += Number(xor & 1n)
+    xor >>= 1n
+  }
+  return count
+}
+
+async function pickSharpest(group: MediaItem[]): Promise<MediaItem> {
+  if (group.length === 1) return group[0]
+  let best = group[0]
+  let bestScore = await computeSharpnessScore(best.path)
+  for (let i = 1; i < group.length; i++) {
+    const score = await computeSharpnessScore(group[i].path)
+    if (score > bestScore) {
+      best = group[i]
+      bestScore = score
+    }
+  }
+  return best
+}
+
+async function deduplicateBurst(sorted: MediaItem[]): Promise<{ items: MediaItem[]; removed: number }> {
+  const result: MediaItem[] = []
+  let burstGroup: MediaItem[] = []
+  let removed = 0
+
+  const flushBurstGroup = async () => {
+    if (burstGroup.length === 0) return
+    if (burstGroup.length === 1) {
+      result.push(burstGroup[0])
+    } else {
+      result.push(await pickSharpest(burstGroup))
+      removed += burstGroup.length - 1
+    }
+    burstGroup = []
+  }
+
+  for (const item of sorted) {
+    if (item.type !== 'photo') {
+      await flushBurstGroup()
+      result.push(item)
+      continue
+    }
+
+    const lastInBurst = burstGroup[burstGroup.length - 1]
+    if (
+      lastInBurst &&
+      lastInBurst.dateTaken &&
+      item.dateTaken &&
+      item.dateTaken - lastInBurst.dateTaken <= BURST_MS
+    ) {
+      burstGroup.push(item)
+    } else {
+      await flushBurstGroup()
+      burstGroup = [item]
+    }
+  }
+  await flushBurstGroup()
+
+  return { items: result, removed }
+}
+
+async function deduplicateVisual(sorted: MediaItem[]): Promise<{ items: MediaItem[]; removed: number }> {
+  const photos: MediaItem[] = []
+  const photoIndices: number[] = []
+  for (let i = 0; i < sorted.length; i++) {
+    if (sorted[i].type === 'photo') {
+      photos.push(sorted[i])
+      photoIndices.push(i)
+    }
+  }
+
+  if (photos.length <= 1) return { items: sorted, removed: 0 }
+
+  const hashes = await Promise.all(photos.map((p) => computeDHash(p.path)))
+  const parent = photos.map((_, i) => i)
+
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]]
+      i = parent[i]
+    }
+    return i
+  }
+
+  const union = (i: number, j: number) => {
+    const pi = find(i)
+    const pj = find(j)
+    if (pi !== pj) parent[pi] = pj
+  }
+
+  for (let i = 0; i < photos.length; i++) {
+    for (let j = i + 1; j < photos.length; j++) {
+      if (hammingDistance(hashes[i], hashes[j]) <= VISUAL_HASH_THRESHOLD) {
+        union(i, j)
+      }
+    }
+  }
+
+  const groups = new Map<number, MediaItem[]>()
+  for (let i = 0; i < photos.length; i++) {
+    const root = find(i)
+    if (!groups.has(root)) groups.set(root, [])
+    groups.get(root)!.push(photos[i])
+  }
+
+  const keptPhotos = new Set<MediaItem>()
+  let removed = 0
+  for (const group of groups.values()) {
+    keptPhotos.add(await pickSharpest(group))
+    if (group.length > 1) removed += group.length - 1
+  }
+
+  const result = sorted.filter((item) => item.type !== 'photo' || keptPhotos.has(item))
+  return { items: result, removed }
+}
+
+function buildArrangeMessage(
+  originalCount: number,
+  finalCount: number,
+  burstRemoved: number,
+  visualRemoved: number,
+): string {
+  const totalRemoved = originalCount - finalCount
+  if (totalRemoved === 0) {
+    return `Sorted ${originalCount} items chronologically`
+  }
+  if (burstRemoved > 0 && visualRemoved > 0) {
+    return `Sorted ${originalCount} items chronologically — removed ${totalRemoved} duplicates (${burstRemoved} burst, ${visualRemoved} visual)`
+  }
+  if (visualRemoved > 0) {
+    return `Sorted ${originalCount} items chronologically — removed ${totalRemoved} duplicates (${visualRemoved} visual)`
+  }
+  return `Sorted ${originalCount} items chronologically — removed ${totalRemoved} duplicates (${burstRemoved} burst)`
 }
 
 async function scanDirectory(dir: string): Promise<string[]> {
@@ -816,7 +980,7 @@ ipcMain.handle('generate-thumbnail', async (_event, filePath: string) => {
   return createThumbnail(filePath, type)
 })
 
-ipcMain.handle('auto-arrange', async (_event, items: MediaItem[]) => {
+ipcMain.handle('auto-arrange', async (_event, items: MediaItem[], dedupOptions: DedupOptions) => {
   const originalCount = items.length
 
   const withDates = await Promise.all(
@@ -828,59 +992,30 @@ ipcMain.handle('auto-arrange', async (_event, items: MediaItem[]) => {
 
   const sorted = [...withDates].sort((a, b) => (a.dateTaken ?? 0) - (b.dateTaken ?? 0))
 
-  const BURST_MS = 3000
-  const result: MediaItem[] = []
+  const useBurst =
+    !dedupOptions.smartVisualDedup || dedupOptions.dedupMode === 'burst' || dedupOptions.dedupMode === 'both'
+  const useVisual =
+    dedupOptions.smartVisualDedup &&
+    (dedupOptions.dedupMode === 'visual' || dedupOptions.dedupMode === 'both')
 
-  let burstGroup: MediaItem[] = []
+  let working = sorted
+  let burstRemoved = 0
+  let visualRemoved = 0
 
-  const flushBurstGroup = async () => {
-    if (burstGroup.length === 0) return
-    if (burstGroup.length === 1) {
-      result.push(burstGroup[0])
-    } else {
-      let best = burstGroup[0]
-      let bestScore = await computeSharpnessScore(best.path)
-      for (let i = 1; i < burstGroup.length; i++) {
-        const score = await computeSharpnessScore(burstGroup[i].path)
-        if (score > bestScore) {
-          best = burstGroup[i]
-          bestScore = score
-        }
-      }
-      result.push(best)
-    }
-    burstGroup = []
+  if (useBurst) {
+    const burstResult = await deduplicateBurst(working)
+    working = burstResult.items
+    burstRemoved = burstResult.removed
   }
 
-  for (const item of sorted) {
-    if (item.type !== 'photo') {
-      await flushBurstGroup()
-      result.push(item)
-      continue
-    }
-
-    const lastInBurst = burstGroup[burstGroup.length - 1]
-    if (
-      lastInBurst &&
-      lastInBurst.dateTaken &&
-      item.dateTaken &&
-      item.dateTaken - lastInBurst.dateTaken <= BURST_MS
-    ) {
-      burstGroup.push(item)
-    } else {
-      await flushBurstGroup()
-      burstGroup = [item]
-    }
+  if (useVisual) {
+    const visualResult = await deduplicateVisual(working)
+    working = visualResult.items
+    visualRemoved = visualResult.removed
   }
-  await flushBurstGroup()
 
-  const removedCount = originalCount - result.length
-  const message =
-    removedCount > 0
-      ? `Sorted ${originalCount} items chronologically, removed ${removedCount} near-duplicates`
-      : `Sorted ${originalCount} items chronologically`
-
-  return { items: result, message }
+  const message = buildArrangeMessage(originalCount, working.length, burstRemoved, visualRemoved)
+  return { items: working, message }
 })
 
 ipcMain.handle('export-video', async (_event, options: ExportOptions) => {
