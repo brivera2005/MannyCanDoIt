@@ -1,6 +1,6 @@
 {
   "name": "mannycandoit",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Simple slideshow maker for photos and videos with background music",
   "main": "dist-electron/main.js",
   "type": "module",
