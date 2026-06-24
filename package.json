@@ -12,6 +12,7 @@
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
+    "electron-updater": "^6.6.2",
     "exifr": "^7.1.3",
     "ffmpeg-static": "^5.2.0",
     "react": "^19.1.0",
@@ -53,7 +54,15 @@
             "x64"
           ]
         }
+      ],
+      "publish": [
+        "github"
       ]
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "brivera2005",
+      "repo": "MannyCanDoIt"
     }
   },
   "license": "MIT"
