@@ -12,7 +12,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
-              external: ['sharp', 'ffmpeg-static', 'exifr'],
+              external: ['sharp', 'ffmpeg-static', 'exifr', 'electron-updater'],
             },
           },
         },
